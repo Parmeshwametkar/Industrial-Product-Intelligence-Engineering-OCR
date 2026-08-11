@@ -1,0 +1,6 @@
+{
+  "name": "Industrial Product Intelligence & Engineering OCR",
+  "description": "AI-powered engineering drawing, blueprint, datasheet, and nameplate OCR parser for e-commerce industrial catalog generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
