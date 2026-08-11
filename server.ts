@@ -252,7 +252,229 @@ app.post("/api/analyze-image", async (req, res) => {
   }
 });
 
-// Health check endpoint
+const QA_SYSTEM_INSTRUCTION = `You are an elite QA Engineer and Adversarial Test Engine for an Industrial Product Image Intelligence system.
+
+Your job is NOT to simply extract product data, but to STRESS-TEST and AUDIT the industrial image, drawing, blueprint, or datasheet.
+
+You must evaluate the image against strict QA requirements:
+1. OCR ACCURACY (check O vs 0, I vs 1, S vs 5, B vs 8, Ø vs O, mm vs inch, UNC vs UNF, decimal points).
+2. ENGINEERING ACCURACY (verify dimensions, threads, pitch, TPI, tolerances. Flag any visually estimated dimensions).
+3. MATERIAL AND COATING (only report materials/coatings explicitly supported by text/callouts in the image. Flag any guessed material).
+4. PERFORMANCE DATA (verify pressure, temp, load, voltage, flow rate. Never invent ratings if absent).
+5. PRODUCT IDENTIFICATION (verify predicted name strictly matches visible evidence).
+6. INDUSTRIAL TAXONOMY (check category specificity like Hex Nuts over Fasteners).
+7. UNSPSC (plausible and relevant UNSPSC code).
+8. MISSING DATA (buyer-critical information missing from drawing).
+9. CROSS-SELL VALIDATION (check compatibility).
+10. HALLUCINATION TEST (flag any assumed, estimated, or fabricated technical attribute).
+
+HARD SAFETY RULE:
+If a critical engineering specification is fabricated:
+anti_hallucination_score MUST be below 50 and overall_result MUST be FAIL.
+
+SCORING (0-100 for each score):
+- accuracy_score
+- ocr_fidelity_score
+- engineering_spec_score
+- anti_hallucination_score
+- taxonomy_score
+- commerce_readiness_score
+
+PASS CONDITIONS:
+- PASS: No critical hallucinations, high accuracy, reliable product ID, correct engineering interpretation.
+- PASS_WITH_WARNINGS: Mostly correct with minor non-critical issues or missing optional specifications.
+- FAIL: Fabricated technical data, major OCR errors, incorrect product ID, dangerous engineering assumptions, or invalid schema.
+
+Return ONLY the QA JSON object conforming strictly to the requested schema.`;
+
+const QA_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    overall_result: {
+      type: Type.STRING,
+      enum: ["PASS", "PASS_WITH_WARNINGS", "FAIL"],
+      description: "Overall audit result",
+    },
+    accuracy_score: { type: Type.INTEGER },
+    ocr_fidelity_score: { type: Type.INTEGER },
+    engineering_spec_score: { type: Type.INTEGER },
+    anti_hallucination_score: { type: Type.INTEGER },
+    taxonomy_score: { type: Type.INTEGER },
+    commerce_readiness_score: { type: Type.INTEGER },
+    verified_attributes: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    ocr_errors: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    engineering_errors: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    hallucinated_attributes: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    unsupported_claims: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    missing_critical_data: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    taxonomy_issues: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    critical_failures: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    recommended_fixes: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+  },
+  required: [
+    "overall_result",
+    "accuracy_score",
+    "ocr_fidelity_score",
+    "engineering_spec_score",
+    "anti_hallucination_score",
+    "taxonomy_score",
+    "commerce_readiness_score",
+    "verified_attributes",
+    "ocr_errors",
+    "engineering_errors",
+    "hallucinated_attributes",
+    "unsupported_claims",
+    "missing_critical_data",
+    "taxonomy_issues",
+    "critical_failures",
+    "recommended_fixes",
+  ],
+};
+
+// API Endpoint for Adversarial QA Audit & QA Report
+app.post("/api/qa-audit", async (req, res) => {
+  try {
+    const { imageBase64, mimeType = "image/png", extractedData } = req.body;
+
+    if (!imageBase64) {
+      return res.status(400).json({
+        success: false,
+        error: "Image base64 data is required for QA audit.",
+      });
+    }
+
+    let cleanBase64 = imageBase64;
+    let detectedMime = mimeType || "image/png";
+
+    if (imageBase64.startsWith("http://") || imageBase64.startsWith("https://")) {
+      try {
+        const fetchRes = await fetch(imageBase64);
+        const arrayBuf = await fetchRes.arrayBuffer();
+        const contentType = fetchRes.headers.get("content-type");
+        if (contentType) detectedMime = contentType;
+        cleanBase64 = Buffer.from(arrayBuf).toString("base64");
+      } catch (fetchErr: any) {
+        return res.status(400).json({
+          success: false,
+          error: `Failed to fetch image from URL: ${fetchErr.message}`,
+        });
+      }
+    } else if (imageBase64.startsWith("data:")) {
+      const commaIdx = imageBase64.indexOf(",");
+      if (commaIdx !== -1) {
+        const header = imageBase64.substring(0, commaIdx);
+        const dataPart = imageBase64.substring(commaIdx + 1);
+
+        const mimeMatch = header.match(/data:([^;]+)/);
+        if (mimeMatch) {
+          detectedMime = mimeMatch[1];
+        }
+
+        if (header.includes(";base64")) {
+          cleanBase64 = dataPart;
+        } else {
+          const decoded = decodeURIComponent(dataPart);
+          cleanBase64 = Buffer.from(decoded, "utf-8").toString("base64");
+        }
+      }
+    }
+
+    const ai = getGeminiClient();
+    let parts: any[] = [];
+
+    if (detectedMime.includes("svg") || cleanBase64.startsWith("<svg") || cleanBase64.startsWith("%3Csvg")) {
+      let svgText = "";
+      try {
+        svgText = Buffer.from(cleanBase64, "base64").toString("utf-8");
+      } catch {
+        svgText = cleanBase64;
+      }
+      parts.push({
+        text: `SVG Drawing Code for QA Inspection:\n\n${svgText}`,
+      });
+    } else {
+      parts.push({
+        inlineData: {
+          mimeType: detectedMime.includes("image") ? detectedMime : "image/png",
+          data: cleanBase64,
+        },
+      });
+    }
+
+    let promptText = "Execute an adversarial QA Audit and stress-test evaluation of this industrial product image according to your QA system instructions.";
+    if (extractedData) {
+      promptText += `\n\nCompare against this extracted catalog dataset to check for hallucinations or OCR misinterpretations:\n${JSON.stringify(extractedData, null, 2)}`;
+    }
+
+    parts.push({ text: promptText });
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.6-flash",
+      contents: { parts },
+      config: {
+        systemInstruction: QA_SYSTEM_INSTRUCTION,
+        responseMimeType: "application/json",
+        responseSchema: QA_RESPONSE_SCHEMA,
+        temperature: 0.1,
+      },
+    });
+
+    const jsonText = response.text || "{}";
+    let cleaned = jsonText.trim();
+    if (cleaned.startsWith("```")) {
+      cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    }
+    const startIdx = cleaned.indexOf("{");
+    const endIdx = cleaned.lastIndexOf("}");
+    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+      cleaned = cleaned.substring(startIdx, endIdx + 1);
+    }
+
+    const qaReport = JSON.parse(cleaned);
+
+    return res.json({
+      success: true,
+      qa_report: qaReport,
+      raw_text: jsonText,
+      audited_at: new Date().toISOString(),
+      model_used: "gemini-3.6-flash",
+    });
+  } catch (err: any) {
+    console.error("Error executing QA audit:", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || "An error occurred during adversarial QA audit execution.",
+    });
+  }
+});
+
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
